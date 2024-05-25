@@ -43,7 +43,7 @@ fn find_dicom_files(dir: &PathBuf) -> impl Iterator<Item = PathBuf> {
         .build()
         .inspect(move |_| spinner.tick())
         .map(PathBuf::from)
-        .filter(|file| is_dicom_file(file, false))
+        .filter(move |file| is_dicom_file(file, false) && file.is_file())
 }
 
 fn convert_dicom_file(
