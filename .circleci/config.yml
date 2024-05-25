@@ -9,6 +9,9 @@ jobs:
             - restore_cache:
                 key: project-cache
             - run:
+                name: Install dependencies
+                command: rustup component add rustfmt
+            - run:
                 name: Check formatting
                 command: cargo fmt -- --check
             - run:
