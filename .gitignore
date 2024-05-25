@@ -139,3 +139,4 @@ coverage.xml
 **/version.py
 .pdm-python
 .vscode/*.code-workspace
+tmp/*
