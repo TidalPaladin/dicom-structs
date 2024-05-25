@@ -1,8 +1,8 @@
 use clap::Parser;
 use dicom::dictionary_std::tags;
 use dicom::object::AccessError;
-use dicom_structs::dicom::{is_dicom_file, open_dicom};
-use dicom_structs::parquet::dicom_to_parquet;
+use dicom_structs_core::dicom::{is_dicom_file, open_dicom};
+use dicom_structs_core::parquet::dicom_to_parquet;
 use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
 use log::{error, info, warn};
 use rayon::prelude::*;
@@ -145,7 +145,7 @@ fn convert_dicom_files<'a>(
 }
 
 #[derive(Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(author = "Scott Chase Waggener", version = "0.1.0", about = "Convert DICOM files to parquet", long_about = None)]
 struct Args {
     #[arg(help = "Directory of DICOM files to process")]
     source_dir: PathBuf,

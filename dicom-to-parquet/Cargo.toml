@@ -1,0 +1,19 @@
+[package]
+name = "dicom-to-parquet"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dicom = "0.7.0"
+dicom-structs-core = { path = "../core" }
+indicatif = { version= "0.17", features= ["rayon"] }
+clap = { version = "4.5", features = ["derive"] }
+rayon = "1.10"
+rust_search = "2.1"
+log = "0.4"
+thiserror = "1.0"
+env_logger = "0.11"
+
+[[bin]]
+name = "dicom-to-parquet"
+path = "src/main.rs"

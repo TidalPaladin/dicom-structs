@@ -1,0 +1,16 @@
+[package]
+name = "dicom-structs-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dicom = "0.7.0"
+arrow = "51.0.0"
+parquet = "51.0.0"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+log = "0.4"
+
+[dev-dependencies]
+tempfile = "3.10"
+dicom-test-files = "0.3"
+rstest = "0.19"

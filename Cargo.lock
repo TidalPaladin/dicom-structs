@@ -761,22 +761,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "dicom-structs"
+name = "dicom-structs-core"
 version = "0.1.0"
 dependencies = [
  "arrow",
- "clap",
  "dicom",
  "dicom-test-files",
- "env_logger",
- "indicatif",
  "log",
  "parquet",
- "rayon",
  "rstest",
- "rust_search",
  "tempfile",
- "thiserror",
  "xxhash-rust",
 ]
 
@@ -790,6 +784,21 @@ dependencies = [
  "tempfile",
  "ureq",
  "zstd 0.12.4",
+]
+
+[[package]]
+name = "dicom-to-parquet"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "dicom",
+ "dicom-structs-core",
+ "env_logger",
+ "indicatif",
+ "log",
+ "rayon",
+ "rust_search",
+ "thiserror",
 ]
 
 [[package]]
