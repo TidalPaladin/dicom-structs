@@ -5,14 +5,16 @@ use arrow::record_batch::RecordBatch;
 use dicom::core::dictionary::DataDictionaryEntry;
 use dicom::core::header::HasLength;
 use dicom::core::value::PrimitiveValue;
-use dicom::core::DataDictionary;
+use dicom::core::DataElement;
 use dicom::core::DicomValue;
+use dicom::core::{DataDictionary, VR};
 use dicom::dictionary_std::tags;
 use dicom::dictionary_std::StandardDataDictionary;
 use dicom::object::InMemDicomObject;
 use parquet::arrow::arrow_writer::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Error;
 use std::path::Path;
@@ -87,6 +89,8 @@ fn match_primitive_value(tag_name: &str, v: &PrimitiveValue, nullable: bool) -> 
 /// * `dicom_path` - Path to the input DICOM file.
 /// * `parquet_path` - Path to the output Parquet file.
 /// * `header_only` - Boolean flag indicating whether to write only the metadata (header) or both metadata and data.
+/// * `hash_pixel_data` - Boolean flag indicating whether to hash the pixel data.
+/// * `overrides` - Optional hash map of tag names to values to override the original DICOM data.
 ///
 /// # Returns
 ///
@@ -101,8 +105,28 @@ pub fn dicom_file_to_parquet(
     parquet_path: &Path,
     header_only: bool,
     hash_pixel_data: bool,
+    overrides: Option<&HashMap<String, String>>,
 ) -> Result<(), Error> {
-    let obj = open_dicom(dicom_path, header_only)?;
+    let mut obj = open_dicom(dicom_path, header_only)?;
+
+    // Add each tag string and value string to the DICOM
+    if overrides.is_some() {
+        for (tag, value) in overrides.unwrap() {
+            // Map string tag to a tag enum
+            let tag = StandardDataDictionary::default()
+                .by_name(tag)
+                .ok_or(Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Tag not found: {}", tag),
+                ))?
+                .tag();
+
+            // Create DICOM element and inject value
+            let element = DataElement::new(tag, VR::LO, value.to_string());
+            obj.put(element);
+        }
+    }
+
     dicom_to_parquet(&obj, parquet_path, header_only, hash_pixel_data)
 }
 
@@ -240,13 +264,14 @@ mod tests {
 
     use dicom::object::OpenFileOptions;
     use rstest::rstest;
+    use std::collections::HashMap;
 
     use super::dicom_file_to_parquet;
 
     use std::fs::File;
 
     #[test]
-    fn dicom_to_parquet_sopuid() {
+    fn test_dicom_to_parquet_sopuid() {
         // Get the expected SOPInstanceUID from the DICOM
         let dicom_file_path = dicom_test_files::path("pydicom/SC_rgb.dcm").unwrap();
         let obj = OpenFileOptions::new()
@@ -260,7 +285,8 @@ mod tests {
 
         // Convert to parquet
         let parquet_file_path = tempfile::NamedTempFile::new().unwrap();
-        dicom_file_to_parquet(&dicom_file_path, parquet_file_path.path(), true, true).unwrap();
+        dicom_file_to_parquet(&dicom_file_path, parquet_file_path.path(), true, true, None)
+            .unwrap();
 
         // Read parquet
         let parquet_file = File::open(parquet_file_path).unwrap();
@@ -281,7 +307,7 @@ mod tests {
     #[rstest]
     #[case(false)]
     #[case(true)]
-    fn dicom_to_parquet_pixel_data(#[case] header_only: bool) {
+    fn test_dicom_to_parquet_pixel_data(#[case] header_only: bool) {
         // Get the expected PixelData from the DICOM
         let dicom_file_path = dicom_test_files::path("pydicom/SC_rgb.dcm").unwrap();
         let obj = OpenFileOptions::new()
@@ -301,6 +327,7 @@ mod tests {
             parquet_file_path.path(),
             header_only,
             true,
+            None,
         )
         .unwrap();
 
@@ -339,5 +366,41 @@ mod tests {
                 assert_eq!(hash, expected_hash);
             }
         };
+    }
+
+    #[test]
+    fn test_dicom_file_to_parquet_with_tag_injection() {
+        let dicom_file_path = dicom_test_files::path("pydicom/SC_rgb.dcm").unwrap();
+
+        // Prepare the overrides with the new tag
+        let mut overrides = HashMap::new();
+        overrides.insert("DataSetName".to_string(), "dataset".to_string());
+
+        // Convert to parquet
+        let parquet_file_path = tempfile::NamedTempFile::new().unwrap();
+        dicom_file_to_parquet(
+            &dicom_file_path,
+            parquet_file_path.path(),
+            false,
+            false,
+            Some(&overrides),
+        )
+        .unwrap();
+
+        // Read the parquet file and verify the injected tag
+        let parquet_file = File::open(parquet_file_path).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(parquet_file).unwrap();
+        let mut reader = builder.build().unwrap();
+        let batch = reader.next().unwrap().unwrap();
+
+        // Check that the DataSetName is present and correct
+        let index = batch.schema().index_of("DataSetName").unwrap();
+        let column = batch.column(index);
+        let data_set_name = column
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0);
+        assert_eq!(data_set_name, "dataset");
     }
 }

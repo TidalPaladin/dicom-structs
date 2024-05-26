@@ -1,5 +1,9 @@
 use clap::Parser;
+use dicom::core::dictionary::DataDictionaryEntry;
+use dicom::core::DataElement;
+use dicom::core::{DataDictionary, VR};
 use dicom::dictionary_std::tags;
+use dicom::dictionary_std::StandardDataDictionary;
 use dicom::object::AccessError;
 use dicom_structs_core::dicom::{is_dicom_file, open_dicom};
 use dicom_structs_core::parquet::dicom_to_parquet;
@@ -7,6 +11,7 @@ use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
 use log::{error, info, warn};
 use rayon::prelude::*;
 use rust_search::SearchBuilder;
+use std::collections::HashMap;
 use std::io::Error;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -51,9 +56,28 @@ fn convert_dicom_file(
     output_dir: &PathBuf,
     header_only: bool,
     hash_pixel_data: bool,
+    overrides: Option<&HashMap<String, String>>,
 ) -> Result<PathBuf, DicomConversionError> {
-    // Open and read SOPInstanceUID and StudyInstanceUID (required fields)
-    let dicom = open_dicom(file, header_only)?;
+    // Open and apply any overrides
+    let mut dicom = open_dicom(file, header_only)?;
+    if overrides.is_some() {
+        for (tag, value) in overrides.unwrap() {
+            // Map string tag to a tag enum
+            let tag = StandardDataDictionary::default()
+                .by_name(tag)
+                .ok_or(Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Tag not found: {}", tag),
+                ))?
+                .tag();
+
+            // Create DICOM element and inject value
+            let element = DataElement::new(tag, VR::LO, value.to_string());
+            dicom.put(element);
+        }
+    }
+
+    // Read SOPInstanceUID and StudyInstanceUID (required fields)
     let sop_instance_uid = dicom
         .element(tags::SOP_INSTANCE_UID)?
         .value()
@@ -112,6 +136,7 @@ fn convert_dicom_files<'a>(
     output_dir: &'a PathBuf,
     header_only: bool,
     hash_pixel_data: bool,
+    overrides: Option<&HashMap<String, String>>,
 ) -> Vec<PathBuf> {
     // Prepare args
     let header_only = header_only;
@@ -132,7 +157,7 @@ fn convert_dicom_files<'a>(
     files
         .into_par_iter()
         .filter_map(move |file| {
-            match convert_dicom_file(file, &output_dir, header_only, hash_pixel_data) {
+            match convert_dicom_file(file, &output_dir, header_only, hash_pixel_data, overrides) {
                 Ok(r) => Some(r),
                 Err(e) => {
                     warn!("Failed to convert DICOM file {}", e);
@@ -144,35 +169,56 @@ fn convert_dicom_files<'a>(
         .collect()
 }
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 #[command(author = "Scott Chase Waggener", version = "0.1.0", about = "Convert DICOM files to parquet", long_about = None)]
 struct Args {
     #[arg(help = "Directory of DICOM files to process")]
     source_dir: PathBuf,
+
     #[arg(help = "Directory to write outputs to")]
     output_dir: PathBuf,
+
     #[arg(
         long = "header-only",
         help = "Don't include pixel data in the output",
         action = clap::ArgAction::SetTrue
     )]
     header_only: bool,
+
     #[arg(
         long = "hash",
         help = "Include a hash of the pixel data in the output. Uses xxh3-64 with seed=0.",
         action = clap::ArgAction::SetTrue
     )]
     hash: bool,
+
+    #[arg(short='t', long = "tag", value_parser = parse_key_val::<String, String>)]
+    tags: Vec<(String, String)>,
 }
 
-fn main() {
-    env_logger::init();
-    let args = Args::parse();
+// Parse a single key-value pair
+fn parse_key_val<T, U>(
+    s: &str,
+) -> Result<(T, U), Box<dyn std::error::Error + Send + Sync + 'static>>
+where
+    T: std::str::FromStr,
+    T::Err: std::error::Error + Send + Sync + 'static,
+    U: std::str::FromStr,
+    U::Err: std::error::Error + Send + Sync + 'static,
+{
+    let pos = s
+        .find('=')
+        .ok_or_else(|| format!("invalid KEY=value: no `=` found in `{s}`"))?;
+    Ok((s[..pos].parse()?, s[pos + 1..].parse()?))
+}
+
+fn run(args: Args) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     info!("Starting DICOM file processor");
     info!("Source directory: {:?}", args.source_dir);
     info!("Output directory: {:?}", args.output_dir);
     info!("Header only: {:?}", args.header_only);
     info!("Hash: {:?}", args.hash);
+    info!("Tags: {:?}", args.tags);
 
     if !args.output_dir.exists() {
         error!("Output directory does not exist: {:?}", args.output_dir);
@@ -190,16 +236,70 @@ fn main() {
         std::process::exit(1);
     }
 
+    let overrides = HashMap::from_iter(args.tags.into_iter());
+    let overrides = match overrides.is_empty() {
+        true => None,
+        false => Some(&overrides),
+    };
+
     let start = Instant::now();
     let dicom_files: Vec<_> = find_dicom_files(&args.source_dir).collect();
     let dicom_files = dicom_files.iter().collect();
-    let parquet_files =
-        convert_dicom_files(dicom_files, &args.output_dir, args.header_only, args.hash);
+    let parquet_files = convert_dicom_files(
+        dicom_files,
+        &args.output_dir,
+        args.header_only,
+        args.hash,
+        overrides,
+    );
 
     let end = Instant::now();
-    println!(
+    info!(
         "Converted {:?} files in {:?}",
         parquet_files.len(),
         end.duration_since(start)
     );
+    Ok(parquet_files)
+}
+
+fn main() {
+    env_logger::init();
+    let args = Args::parse();
+    run(args).unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{run, Args};
+
+    #[test]
+    fn test_main() {
+        // Get the expected SOPInstanceUID from the DICOM
+        let dicom_file_path = dicom_test_files::path("pydicom/SC_rgb.dcm").unwrap();
+
+        // Create a temp directory and copy the test file to it
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dicom_path = temp_dir.path().join("SC_rgb.dcm");
+        std::fs::copy(&dicom_file_path, &temp_dicom_path).unwrap();
+
+        // Create a temp directory to hold the output
+        let output_dir = tempfile::tempdir().unwrap();
+
+        // Run the main function
+        let args = Args {
+            source_dir: temp_dir.path().to_path_buf(),
+            output_dir: output_dir.path().to_path_buf(),
+            header_only: false,
+            hash: true,
+            tags: vec![],
+        };
+        run(args).unwrap(); // Assuming `main` is adapted to take `Args` struct
+
+        // Check that an output Parquet file was created
+        let output_files = std::fs::read_dir(output_dir.path()).unwrap();
+        assert!(
+            output_files.count() > 0,
+            "No files were created in the output directory."
+        );
+    }
 }

@@ -17,3 +17,7 @@ env_logger = "0.11"
 [[bin]]
 name = "dicom-to-parquet"
 path = "src/main.rs"
+
+[dev-dependencies]
+tempfile = "3.10"
+dicom-test-files = "0.3"

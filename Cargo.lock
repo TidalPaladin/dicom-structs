@@ -793,11 +793,13 @@ dependencies = [
  "clap",
  "dicom",
  "dicom-structs-core",
+ "dicom-test-files",
  "env_logger",
  "indicatif",
  "log",
  "rayon",
  "rust_search",
+ "tempfile",
  "thiserror",
 ]
 
