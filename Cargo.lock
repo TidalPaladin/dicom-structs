@@ -513,6 +513,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "98cc8fbded0c607b7ba9dd60cd98df59af97e84d24e49c8557331cfc26d301ce"
 
 [[package]]
+name = "collect-parquet"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "clap",
+ "dicom-structs-core",
+ "dicom-test-files",
+ "env_logger",
+ "indicatif",
+ "log",
+ "parquet",
+ "rayon",
+ "rust_search",
+ "tempfile",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -709,6 +726,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "dicom-json"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f9e0d36ff03fe9ff96e028390d30410cb5597a5a47b8e0137f9e534012bd574"
+dependencies = [
+ "base64",
+ "dicom-core",
+ "dicom-dictionary-std",
+ "dicom-object",
+ "num-traits",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "dicom-object"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -766,10 +799,13 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "dicom",
+ "dicom-json",
  "dicom-test-files",
  "log",
  "parquet",
  "rstest",
+ "serde_json",
+ "snafu",
  "tempfile",
  "xxhash-rust",
 ]
@@ -2013,6 +2049,7 @@ version = "1.0.117"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "455182ea6142b14f93f4bc5320a2b31c1f266b66a4a5c858b013302a5d8cbfc3"
 dependencies = [
+ "indexmap",
  "itoa",
  "ryu",
  "serde",

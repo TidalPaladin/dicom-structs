@@ -126,7 +126,8 @@ fn convert_dicom_file(
     std::fs::create_dir_all(output_file.parent().unwrap())?;
 
     // Run the conversion
-    dicom_to_parquet(&dicom, &output_file, header_only, hash_pixel_data)?;
+    dicom_to_parquet(&dicom, &output_file, header_only, hash_pixel_data)
+        .map_err(|e| DicomConversionError::Other(e.to_string()))?;
     Ok(output_file)
 }
 

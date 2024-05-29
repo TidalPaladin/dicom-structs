@@ -1,80 +1,241 @@
 use crate::dicom::open_dicom;
+use crate::error::Error;
 use arrow::array::*;
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::compute::kernels::cast_utils::Parser;
+use arrow::datatypes::{DataType, Date64Type, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use dicom::core::dictionary::DataDictionaryEntry;
 use dicom::core::header::HasLength;
-use dicom::core::value::PrimitiveValue;
+use dicom::core::value::{DataSetSequence, PixelFragmentSequence, PrimitiveValue};
 use dicom::core::DataElement;
 use dicom::core::DicomValue;
 use dicom::core::{DataDictionary, VR};
 use dicom::dictionary_std::tags;
 use dicom::dictionary_std::StandardDataDictionary;
 use dicom::object::InMemDicomObject;
+use dicom_json::DicomJson;
 use parquet::arrow::arrow_writer::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
+use serde_json;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Error;
 use std::path::Path;
 use std::sync::Arc;
 
-// Match a DICOM value type to an Arrow type
-fn match_primitive_value(tag_name: &str, v: &PrimitiveValue, nullable: bool) -> (Field, ArrayRef) {
-    let data_type = match v {
-        PrimitiveValue::F32(_) => DataType::Float32,
-        PrimitiveValue::F64(_) => DataType::Float64,
-        PrimitiveValue::I16(_) => DataType::Int16,
-        PrimitiveValue::U16(_) => DataType::UInt16,
-        PrimitiveValue::I32(_) => DataType::Int32,
-        PrimitiveValue::U32(_) => DataType::UInt32,
-        PrimitiveValue::I64(_) => DataType::Int64,
-        PrimitiveValue::U64(_) => DataType::UInt64,
-        PrimitiveValue::U8(_) => DataType::UInt8,
-        PrimitiveValue::Strs(_) => DataType::Utf8,
-        PrimitiveValue::Str(_) => DataType::Utf8,
-        _ => DataType::Utf8,
-    };
-    let field = Field::new(tag_name, data_type.clone(), nullable);
+pub type DicomElement = DataElement<InMemDicomObject>;
 
-    let array: ArrayRef = match v {
-        PrimitiveValue::F32(f) => Arc::new(Float32Array::from(f.to_vec())),
-        PrimitiveValue::F64(f) => Arc::new(Float64Array::from(f.to_vec())),
-        PrimitiveValue::I16(f) => Arc::new(Int16Array::from(f.to_vec())),
-        PrimitiveValue::U16(f) => Arc::new(UInt16Array::from(f.to_vec())),
-        PrimitiveValue::I32(f) => Arc::new(Int32Array::from(f.to_vec())),
-        PrimitiveValue::U32(f) => Arc::new(UInt32Array::from(f.to_vec())),
-        PrimitiveValue::I64(f) => Arc::new(Int64Array::from(f.to_vec())),
-        PrimitiveValue::U64(f) => Arc::new(UInt64Array::from(f.to_vec())),
-        PrimitiveValue::U8(f) => Arc::new(UInt8Array::from(f.to_vec())),
-        PrimitiveValue::Strs(f) => Arc::new(StringArray::from(f.to_vec())),
-        PrimitiveValue::Str(f) => Arc::new(StringArray::from(vec![f.as_str()])),
-        f => Arc::new(StringArray::from(vec![f.to_string()])),
-    };
+pub trait ArrayWrap {
+    /// Wrap the array in a list array of length 1
+    fn wrap_as_list(&self) -> Self;
+}
 
-    // If the data has non-unit length, wrap it in a length-1 list
-    let (array, field) = match array.len() {
-        0 => panic!("Array should never be length 0"),
-        1 => (array, field),
-        _ => {
-            let nested_field = Arc::new(Field::new("item", array.data_type().clone(), false));
-            let offsets = Int32Array::from(vec![0, array.len() as i32]);
-            let list_data = ArrayData::builder(DataType::List(nested_field))
-                .len(1)
-                .add_buffer(offsets.to_data().buffers()[0].clone())
-                .add_child_data(array.to_data())
-                .build()
-                .unwrap();
+impl ArrayWrap for ArrayRef {
+    fn wrap_as_list(&self) -> Self {
+        let nested_field = Arc::new(Field::new("item", self.data_type().clone(), true));
+        let offsets = Int32Array::from(vec![0, self.len() as i32]);
+        let list_data = ArrayData::builder(DataType::List(nested_field))
+            .len(1)
+            .add_buffer(offsets.to_data().buffers()[0].clone())
+            .add_child_data(self.to_data())
+            .build()
+            .unwrap();
+        Arc::new(ListArray::from(list_data))
+    }
+}
 
-            let array = ListArray::from(list_data);
-            let field = Field::new(tag_name, array.data_type().clone(), nullable);
-            (Arc::new(array) as ArrayRef, field)
+impl ArrayWrap for Field {
+    fn wrap_as_list(&self) -> Self {
+        let nested_field = Arc::new(Field::new("item", self.data_type().clone(), true));
+        Field::new(
+            self.name(),
+            DataType::List(nested_field),
+            self.is_nullable(),
+        )
+    }
+}
+
+trait FromDicom: Sized {
+    /// Create from a DICOM PrimitiveValue
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - A reference to a PrimitiveValue object
+    ///
+    /// # Returns
+    ///
+    /// * Converted value, or None if the value is empty
+    fn from_dicom_primitive(value: &PrimitiveValue) -> Option<Self>;
+
+    /// Create from a DICOM sequence
+    ///
+    /// # Arguments
+    ///
+    /// * `seq` - A reference to a DataSetSequence object
+    ///
+    /// # Returns
+    ///
+    /// * Converted value, or None if the sequence is empty
+    fn from_dicom_sequence(seq: &DataSetSequence<InMemDicomObject>) -> Option<Self>;
+
+    /// Create from a DICOM pixel sequence
+    ///
+    /// # Arguments
+    ///
+    /// * `seq` - A reference to a PixelFragmentSequence object
+    ///
+    /// # Returns
+    ///
+    /// * Converted value, or None if the sequence is empty
+    fn from_dicom_pixel_sequence(seq: &PixelFragmentSequence<Vec<u8>>) -> Option<Self>;
+
+    /// Create from a DICOM element
+    ///
+    /// # Arguments
+    ///
+    /// * `elem` - A reference to a DicomElement object
+    ///
+    /// # Returns
+    ///
+    /// * Converted value, or None if the element is of sequence type and the sequence is empty
+    fn from_dicom_element(elem: &DicomElement) -> Option<Self>;
+}
+
+impl FromDicom for DataType {
+    fn from_dicom_primitive(value: &PrimitiveValue) -> Option<DataType> {
+        // For multiplicity > 1, we will convert the contents to string
+        if value.multiplicity() > 1 {
+            return Some(DataType::Utf8);
+        } else if value.is_empty() {
+            return None;
         }
-    };
+        // https://dicom.nema.org/dicom/2013/output/chtml/part05/sect_6.2.html
+        Some(match value {
+            PrimitiveValue::Date(_) => DataType::Date64, // 128 bits per DICOM standard, Arrow max is 64
+            PrimitiveValue::U8(_) => DataType::UInt8,
+            PrimitiveValue::U16(_) => DataType::UInt16,
+            PrimitiveValue::I16(_) => DataType::Int16,
+            PrimitiveValue::U32(_) => DataType::UInt32,
+            PrimitiveValue::I32(_) => DataType::Int32,
+            PrimitiveValue::F32(_) => DataType::Float32,
+            PrimitiveValue::U64(_) => DataType::UInt64,
+            PrimitiveValue::I64(_) => DataType::Int64,
+            PrimitiveValue::F64(_) => DataType::Float64,
+            PrimitiveValue::Strs(_) => DataType::Utf8,
+            PrimitiveValue::Str(_) => DataType::Utf8,
+            _ => DataType::Utf8,
+        })
+    }
 
-    assert_eq!(array.len(), 1, "Arrow array should have length 1");
-    (field, array)
+    fn from_dicom_sequence(seq: &DataSetSequence<InMemDicomObject>) -> Option<Self> {
+        // Sequences can be nested so we will flatten them to string
+        match seq.is_empty() {
+            true => None,
+            false => Some(DataType::Utf8),
+        }
+    }
+
+    fn from_dicom_pixel_sequence(pixels: &PixelFragmentSequence<Vec<u8>>) -> Option<Self> {
+        match pixels.is_empty() {
+            true => None,
+            false => Some(DataType::Binary),
+        }
+    }
+
+    fn from_dicom_element(elem: &DicomElement) -> Option<Self> {
+        // Sometimes PixelData is not a PixelSequence, so catch it manually and force to binary
+        if elem.header().tag == tags::PIXEL_DATA {
+            return Some(DataType::Binary).filter(|_| !elem.value().is_empty());
+        }
+        match elem.value() {
+            DicomValue::Primitive(v) => Self::from_dicom_primitive(v),
+            DicomValue::Sequence(v) => Self::from_dicom_sequence(v),
+            DicomValue::PixelSequence(v) => Self::from_dicom_pixel_sequence(v),
+        }
+    }
+}
+
+impl FromDicom for ArrayRef {
+    fn from_dicom_primitive(value: &PrimitiveValue) -> Option<ArrayRef> {
+        // For multiplicity > 1, we will convert the contents to string
+        if value.multiplicity() > 1 {
+            return Some(Arc::new(StringArray::from(vec![value.to_string()])));
+        } else if value.is_empty() {
+            return None;
+        }
+        Some(match value {
+            PrimitiveValue::Date(f) => Arc::new(Date64Array::from(
+                f.iter()
+                    .map(|x| {
+                        Date64Type::parse(&format!(
+                            "{:04}-{:02}-{:02}",
+                            x.year(),
+                            x.month().unwrap_or(&0),
+                            x.day().unwrap_or(&0)
+                        ))
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+            PrimitiveValue::U8(f) => Arc::new(UInt8Array::from(f.to_vec())),
+            PrimitiveValue::U16(f) => Arc::new(UInt16Array::from(f.to_vec())),
+            PrimitiveValue::I16(f) => Arc::new(Int16Array::from(f.to_vec())),
+            PrimitiveValue::U32(f) => Arc::new(UInt32Array::from(f.to_vec())),
+            PrimitiveValue::I32(f) => Arc::new(Int32Array::from(f.to_vec())),
+            PrimitiveValue::F32(f) => Arc::new(Float32Array::from(f.to_vec())),
+            PrimitiveValue::U64(f) => Arc::new(UInt64Array::from(f.to_vec())),
+            PrimitiveValue::I64(f) => Arc::new(Int64Array::from(f.to_vec())),
+            PrimitiveValue::F64(f) => Arc::new(Float64Array::from(f.to_vec())),
+            PrimitiveValue::Strs(f) => Arc::new(StringArray::from(f.to_vec())),
+            PrimitiveValue::Str(f) => Arc::new(StringArray::from(vec![f.as_str()])),
+            f => Arc::new(StringArray::from(vec![f.to_string()])),
+        })
+    }
+
+    fn from_dicom_sequence(seq: &DataSetSequence<InMemDicomObject>) -> Option<ArrayRef> {
+        if seq.is_empty() {
+            return None;
+        }
+
+        // Convert each sequence element to a JSON string
+        let sub_jsons = seq
+            .items()
+            .into_iter()
+            .map(DicomJson::from)
+            .filter_map(|x| serde_json::to_value(&x).ok())
+            .map(|x| x.to_string())
+            .collect::<Vec<_>>();
+
+        match serde_json::to_value(sub_jsons) {
+            Ok(v) => Some(Arc::new(StringArray::from(vec![v.to_string()]))),
+            Err(_) => None,
+        }
+    }
+
+    fn from_dicom_pixel_sequence(pixels: &PixelFragmentSequence<Vec<u8>>) -> Option<Self> {
+        match pixels.is_empty() {
+            true => None,
+            false => {
+                // Read the offset table and fragments and flatten them into a stream
+                let offset_table = pixels.offset_table().iter().flat_map(|x| x.to_le_bytes());
+                let fragments = pixels.fragments().iter().flatten().copied();
+                let raw_data = offset_table.chain(fragments).collect::<Vec<u8>>();
+                Some(Arc::new(BinaryArray::from(vec![raw_data.as_slice()])))
+            }
+        }
+    }
+
+    fn from_dicom_element(elem: &DicomElement) -> Option<ArrayRef> {
+        match (elem.header().tag, elem.value()) {
+            // Sometimes PixelData is not a PixelSequence, so catch it manually and force to binary
+            (tags::PIXEL_DATA, DicomValue::Primitive(p)) => match p.is_empty() {
+                true => None,
+                false => Some(Arc::new(BinaryArray::from(vec![p.to_bytes().as_ref()]))),
+            },
+            (_, DicomValue::PixelSequence(v)) => Self::from_dicom_pixel_sequence(v),
+            (_, DicomValue::Sequence(v)) => Self::from_dicom_sequence(v),
+            (_, DicomValue::Primitive(v)) => Self::from_dicom_primitive(v),
+        }
+    }
 }
 
 /// Hashes pixel data if required and writes DICOM data to a Parquet file.
@@ -107,7 +268,10 @@ pub fn dicom_file_to_parquet(
     hash_pixel_data: bool,
     overrides: Option<&HashMap<String, String>>,
 ) -> Result<(), Error> {
-    let mut obj = open_dicom(dicom_path, header_only)?;
+    let mut obj = open_dicom(dicom_path, header_only).map_err(|e| Error::Whatever {
+        message: format!("Failed to open DICOM file: {}", e),
+        source: Some(Box::new(e)),
+    })?;
 
     // Add each tag string and value string to the DICOM
     if overrides.is_some() {
@@ -115,10 +279,9 @@ pub fn dicom_file_to_parquet(
             // Map string tag to a tag enum
             let tag = StandardDataDictionary::default()
                 .by_name(tag)
-                .ok_or(Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Tag not found: {}", tag),
-                ))?
+                .ok_or(Error::TagNotFound {
+                    tag_name: tag.to_string(),
+                })?
                 .tag();
 
             // Create DICOM element and inject value
@@ -163,8 +326,8 @@ pub fn dicom_to_parquet(
 
     // Loop through tags and add to schema and arrays
     for element in dicom.into_iter() {
-        let (header, value) = (&element.header(), &element.value());
-        if value.is_empty() {
+        let (header, value) = (&element.header(), element.value());
+        if value.is_empty() || (header_only && header.tag == tags::PIXEL_DATA) {
             continue;
         }
 
@@ -175,40 +338,16 @@ pub fn dicom_to_parquet(
         let nullable =
             header.tag != tags::SOP_INSTANCE_UID && header.tag != tags::STUDY_INSTANCE_UID;
 
-        match value {
-            DicomValue::Primitive(v) => {
-                let (field, array) = match_primitive_value(&tag_name, v, nullable);
-                assert!(array.len() == 1, "Array should have length 1");
-                fields.push(field);
-                arrays.push(array);
-            }
-            // Sequence types are added to the arrays as lists of strings
-            DicomValue::Sequence(seq) => {
-                let seq_values: Vec<String> = seq
-                    .items()
-                    .iter()
-                    .map(|item| format!("{:?}", item))
-                    .collect();
-                if !seq_values.is_empty() {
-                    fields.push(Field::new(&tag_name, DataType::Utf8, true));
-                    arrays.push(Arc::new(StringArray::from(seq_values)) as ArrayRef);
-                }
-            }
-            // Multi-frame pixel data
-            DicomValue::PixelSequence(pixels) => {
-                if !header_only {
-                    // Read the offset table and fragments and flatten them into a stream
-                    let offset_table = pixels.offset_table().iter().flat_map(|x| x.to_le_bytes());
-                    let fragments = pixels.fragments().iter().flatten().copied();
-                    let raw_data = offset_table.chain(fragments).collect::<Vec<u8>>();
+        let field = DataType::from_dicom_element(element)
+            .and_then(|dtype| Some(Field::new(tag_name, dtype, nullable)));
+        let array = ArrayRef::from_dicom_element(element);
 
-                    let array = BinaryArray::from(vec![raw_data.as_slice()]);
-                    if !array.is_empty() {
-                        fields.push(Field::new(&tag_name, DataType::Binary, true));
-                        arrays.push(Arc::new(array) as ArrayRef);
-                    }
-                }
+        match (field, array) {
+            (Some(f), Some(a)) => {
+                fields.push(f);
+                arrays.push(a);
             }
+            _ => {}
         }
     }
 
@@ -222,12 +361,21 @@ pub fn dicom_to_parquet(
 
         // Add the hashed pixel data to the schema and arrays
         if has_pixel_data {
-            let hashed_pixel_data = crate::dicom::hash_pixel_data(dicom)
-                .map_err(|e| Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            let hashed_pixel_data =
+                crate::dicom::hash_pixel_data(dicom).map_err(|_| Error::PixelHashError)?;
             fields.push(Field::new("PixelDataHash", DataType::UInt64, true));
             arrays.push(Arc::new(UInt64Array::from(vec![hashed_pixel_data])) as ArrayRef);
         }
     }
+
+    fields.iter().zip(arrays.iter()).for_each(|(field, array)| {
+        assert!(
+            array.len() == 1,
+            "Array {} should have length 1, found {}",
+            field.name(),
+            array.len()
+        );
+    });
 
     // Create schema
     let schema = Arc::new(Schema::new(fields));
@@ -238,27 +386,37 @@ pub fn dicom_to_parquet(
         .build();
 
     // Setup the writer
-    let file = File::create(parquet_path)?;
-    let mut arrow_writer = ArrowWriter::try_new(file, schema.clone(), Some(props))
-        .map_err(|e| Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    let file = File::create(parquet_path).map_err(|e| Error::Whatever {
+        message: format!("Error while creating file: {}", e),
+        source: Some(Box::new(e)),
+    })?;
+    let mut arrow_writer =
+        ArrowWriter::try_new(file, schema.clone(), Some(props)).map_err(|e| Error::Whatever {
+            message: format!("Error while creating writer: {}", e),
+            source: Some(Box::new(e)),
+        })?;
 
     // Set up the batch to write
-    let batch = RecordBatch::try_new(schema, arrays)
-        .map_err(|e| Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    let batch = RecordBatch::try_new(schema, arrays).map_err(|e| Error::Whatever {
+        message: format!("Error while creating batch: {}", e),
+        source: Some(Box::new(e)),
+    })?;
 
     // Run write op
-    arrow_writer
-        .write(&batch)
-        .map_err(|e| Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-    arrow_writer
-        .close()
-        .map_err(|e| Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    arrow_writer.write(&batch).map_err(|e| Error::Whatever {
+        message: format!("Error while writing batch: {}", e),
+        source: Some(Box::new(e)),
+    })?;
+    arrow_writer.close().map_err(|e| Error::Whatever {
+        message: format!("Error while closing writer: {}", e),
+        source: Some(Box::new(e)),
+    })?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::{ListArray, PrimitiveArray, StringArray, UInt64Array};
+    use arrow::array::{BinaryArray, StringArray, UInt64Array};
 
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -342,18 +500,18 @@ mod tests {
             true => {
                 // PixelData should not be present in the schema
                 let index = batch.schema().index_of("PixelData");
-                println!("{:?}", batch.schema());
                 assert!(index.is_err());
             }
             false => {
                 // PixelData should be present in the schema
+                println!("{:?}", batch.schema());
                 let column = batch.column(batch.schema().index_of("PixelData").unwrap());
                 let pixel_data = column
                     .as_any()
-                    .downcast_ref::<ListArray>()
+                    .downcast_ref::<BinaryArray>()
                     .unwrap()
                     .value(0);
-                assert_eq!(*pixel_data, PrimitiveArray::from(expected));
+                assert_eq!(*pixel_data, expected);
 
                 // PixelData hash should be present in the schema
                 let column = batch.column(batch.schema().index_of("PixelDataHash").unwrap());
@@ -402,5 +560,26 @@ mod tests {
             .unwrap()
             .value(0);
         assert_eq!(data_set_name, "dataset");
+    }
+
+    #[rstest]
+    #[case("pydicom/SC_rgb.dcm")]
+    #[case("pydicom/CT_small.dcm")]
+    #[case("pydicom/vlut_04.dcm")]
+    #[case("pydicom/JPEG-LL.dcm")]
+    #[case("pydicom/JPEG2000_UNC.dcm")]
+    #[case("pydicom/MR-SIEMENS-DICOM-WithOverlays.dcm")]
+    #[case("pydicom/MR2_J2KI.dcm")]
+    #[case("pydicom/US1_UNCR.dcm")]
+    #[case("pydicom/emri_small_RLE.dcm")]
+    #[case("pydicom/bad_sequence.dcm")]
+    #[case("pydicom/SC_rgb_expb_32bit_2frame.dcm")]
+    #[case("pydicom/693_J2KR.dcm")]
+    fn test_convert_various_files(#[case] dicom_file_name: &str) {
+        let dicom_file_path = dicom_test_files::path(dicom_file_name).unwrap();
+        let parquet_file_path = tempfile::NamedTempFile::new().unwrap();
+        let parquet_file_path = parquet_file_path.path();
+        dicom_file_to_parquet(&dicom_file_path, parquet_file_path, false, true, None).unwrap();
+        assert!(parquet_file_path.is_file());
     }
 }

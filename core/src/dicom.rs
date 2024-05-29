@@ -1,5 +1,7 @@
+use dicom::core::DicomValue;
 use dicom::dictionary_std::tags;
 use dicom::object::{FileDicomObject, InMemDicomObject, OpenFileOptions};
+use std::borrow::Cow;
 use std::fs::File;
 use std::io::{self, Error, Read, Seek};
 use std::path::Path;
@@ -79,11 +81,24 @@ pub fn is_dicom_file(path: &Path, check_file: bool) -> bool {
     }
 }
 
-// Compute a MD5 hash of the decompressed pixel data
+/// Compute a MD5 hash of (encapculated) pixel data
 #[allow(dead_code)]
 pub fn hash_pixel_data(dcm: &InMemDicomObject) -> Result<u64, Box<dyn std::error::Error>> {
-    let pixel_data = dcm.element_by_name("PixelData")?.to_bytes()?;
-    Ok(xxh3_64_with_seed(&pixel_data, HASH_SEED))
+    let element = dcm.element(tags::PIXEL_DATA)?;
+    match element.value() {
+        DicomValue::PixelSequence(v) => {
+            // NOTE: Offset table isn't hashed, only 
+            let fragments = v.fragments().into_iter().map(|f| Cow::from(f));
+            // Hash each fragment and sum with wrapping overflow
+            let hash_sum = fragments.fold(0u64, |acc, f| acc.wrapping_add(xxh3_64_with_seed(&f, HASH_SEED)));
+            Ok(hash_sum)
+        }
+        DicomValue::Primitive(v) => {
+            let pixel_data = v.to_bytes();
+            Ok(xxh3_64_with_seed(&pixel_data, HASH_SEED))
+        }
+        _ => panic!("Should never encounter pixel data as something other than a primitive or pixel sequence"),
+    }
 }
 
 // Open a DICOM file, optionally reading only the header
@@ -230,10 +245,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_hash_pixel_data() {
+    #[rstest]
+    #[case("pydicom/SC_rgb.dcm")]
+    #[case("pydicom/CT_small.dcm")]
+    #[case("pydicom/vlut_04.dcm")]
+    #[case("pydicom/JPEG-LL.dcm")]
+    #[case("pydicom/JPEG2000_UNC.dcm")]
+    #[case("pydicom/MR-SIEMENS-DICOM-WithOverlays.dcm")]
+    fn test_hash_pixel_data(#[case] file: &str) {
         // Get the expected PixelData from the DICOM
-        let dicom_file_path = dicom_test_files::path("pydicom/SC_rgb.dcm").unwrap();
+        let dicom_file_path = dicom_test_files::path(file).unwrap();
         let obj = OpenFileOptions::new()
             .open_file(dicom_file_path.clone())
             .unwrap();

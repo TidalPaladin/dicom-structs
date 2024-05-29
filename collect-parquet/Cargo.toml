@@ -1,0 +1,20 @@
+[package]
+name = "collect-parquet"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arrow = "51.0.0"
+parquet = "51.0.0"
+log = "0.4"
+indicatif = { version= "0.17", features= ["rayon"] }
+clap = { version = "4.5", features = ["derive"] }
+rayon = "1.10"
+rust_search = "2.1"
+env_logger = "0.11"
+dicom-structs-core = { path = "../core" }
+
+[dev-dependencies]
+tempfile = "3.10"
+dicom-test-files = "0.3"
+dicom-structs-core = { path = "../core" }
