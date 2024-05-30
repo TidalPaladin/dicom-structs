@@ -59,7 +59,7 @@ fn convert_dicom_file(
     overrides: Option<&HashMap<String, String>>,
 ) -> Result<PathBuf, DicomConversionError> {
     // Open and apply any overrides
-    let mut dicom = open_dicom(file, header_only)?;
+    let mut dicom = open_dicom(file, header_only && !hash_pixel_data)?;
     if overrides.is_some() {
         for (tag, value) in overrides.unwrap() {
             // Map string tag to a tag enum

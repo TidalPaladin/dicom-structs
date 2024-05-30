@@ -270,10 +270,11 @@ pub fn dicom_file_to_parquet(
     hash_pixel_data: bool,
     overrides: Option<&HashMap<String, String>>,
 ) -> Result<(), Error> {
-    let mut obj = open_dicom(dicom_path, header_only).map_err(|e| Error::Whatever {
-        message: format!("Failed to open DICOM file: {}", e),
-        source: Some(Box::new(e)),
-    })?;
+    let mut obj =
+        open_dicom(dicom_path, header_only && !hash_pixel_data).map_err(|e| Error::Whatever {
+            message: format!("Failed to open DICOM file: {}", e),
+            source: Some(Box::new(e)),
+        })?;
 
     // Add each tag string and value string to the DICOM
     if overrides.is_some() {
@@ -606,6 +607,44 @@ mod tests {
             .unwrap()
             .value(0);
         assert_eq!(tsuid, "1.2.840.10008.1.2.1\0");
+    }
+
+    #[test]
+    fn test_hash_but_not_store_pixels() {
+        // Convert to parquet
+        let dicom_file_path = dicom_test_files::path("pydicom/SC_rgb.dcm").unwrap();
+        let parquet_file_path = tempfile::NamedTempFile::new().unwrap();
+        let (header_only, hash_pixel_data) = (true, true);
+        dicom_file_to_parquet(
+            &dicom_file_path,
+            parquet_file_path.path(),
+            header_only,
+            hash_pixel_data,
+            None,
+        )
+        .unwrap();
+
+        // Read parquet
+        let parquet_file = File::open(parquet_file_path).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(parquet_file).unwrap();
+        let mut reader = builder.build().unwrap();
+        let batch = reader.next().unwrap().unwrap();
+
+        // PixelData shouldn't be in the output
+        assert!(
+            batch.schema().index_of("PixelData").is_err(),
+            "PixelData should not be present when header_only is true"
+        );
+
+        // But PixelData should have been hashed
+        let column = batch.column(batch.schema().index_of("PixelDataHash").unwrap());
+        let expected_hash = 10240938377863354873_u64;
+        let hash = column
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(hash, expected_hash);
     }
 
     #[rstest]
