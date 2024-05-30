@@ -208,7 +208,7 @@ struct Args {
     )]
     hash: bool,
 
-    #[arg(short='t', long = "tag", value_parser = parse_key_val::<String, String>)]
+    #[arg(short='t', long = "tag", value_parser = parse_key_val::<String, String>, help="Override a DICOM tag with a constant value")]
     tags: Vec<(String, String)>,
 
     #[arg(
