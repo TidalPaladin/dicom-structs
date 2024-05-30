@@ -12,6 +12,8 @@ use dicom::core::DicomValue;
 use dicom::core::{DataDictionary, VR};
 use dicom::dictionary_std::tags;
 use dicom::dictionary_std::StandardDataDictionary;
+use dicom::object::mem::InMemElement;
+use dicom::object::FileDicomObject;
 use dicom::object::InMemDicomObject;
 use dicom_json::DicomJson;
 use parquet::arrow::arrow_writer::ArrowWriter;
@@ -315,17 +317,29 @@ pub fn dicom_file_to_parquet(
 /// This function will return an error if there is an issue with reading the DICOM data,
 /// processing the pixel data, or writing to the Parquet file.
 pub fn dicom_to_parquet(
-    dicom: &InMemDicomObject,
+    dicom: &FileDicomObject<InMemDicomObject>,
     parquet_path: &Path,
     header_only: bool,
     hash_pixel_data: bool,
 ) -> Result<(), Error> {
-    // Extract metadata and data
+    // Allocate containers to hold Parquet fields and arrays
     let mut fields = vec![];
     let mut arrays: Vec<ArrayRef> = vec![];
 
-    // Loop through tags and add to schema and arrays
-    for element in dicom.into_iter() {
+    // Extract metadata header elements and make them compatible with the rest of the data
+    let meta_elems = dicom
+        .meta()
+        .to_element_iter()
+        .map(|e| e.into_parts())
+        .filter_map(|(header, value)| match value.into_primitive() {
+            Some(v) => Some(InMemElement::new(header.tag, header.vr(), v)),
+            None => None,
+        })
+        .collect::<Vec<_>>();
+
+    // Loop through header and body tags and add to schema / arrays
+    let elements = dicom.into_iter().chain(meta_elems.iter());
+    for element in elements {
         let (header, value) = (&element.header(), element.value());
         if value.is_empty() || (header_only && header.tag == tags::PIXEL_DATA) {
             continue;
@@ -560,6 +574,38 @@ mod tests {
             .unwrap()
             .value(0);
         assert_eq!(data_set_name, "dataset");
+    }
+
+    #[test]
+    fn test_dicom_file_to_parquet_file_meta() {
+        let dicom_file_path = dicom_test_files::path("pydicom/SC_rgb.dcm").unwrap();
+
+        // Convert to parquet
+        let parquet_file_path = tempfile::NamedTempFile::new().unwrap();
+        dicom_file_to_parquet(
+            &dicom_file_path,
+            parquet_file_path.path(),
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+
+        // Read the parquet file and verify TransferSyntaxUID
+        let parquet_file = File::open(parquet_file_path).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(parquet_file).unwrap();
+        let mut reader = builder.build().unwrap();
+        let batch = reader.next().unwrap().unwrap();
+
+        // Check that the DataSetName is present and correct
+        let index = batch.schema().index_of("TransferSyntaxUID").unwrap();
+        let column = batch.column(index);
+        let tsuid = column
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0);
+        assert_eq!(tsuid, "1.2.840.10008.1.2.1\0");
     }
 
     #[rstest]
