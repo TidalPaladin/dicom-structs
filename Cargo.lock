@@ -803,6 +803,7 @@ dependencies = [
  "dicom-test-files",
  "log",
  "parquet",
+ "regex",
  "rstest",
  "serde_json",
  "snafu",

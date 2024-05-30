@@ -309,6 +309,7 @@ mod tests {
             true,
             false,
             None,
+            true,
         )
         .unwrap();
         dicom_file_to_parquet(
@@ -317,6 +318,7 @@ mod tests {
             true,
             false,
             None,
+            true,
         )
         .unwrap();
 

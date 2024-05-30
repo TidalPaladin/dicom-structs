@@ -57,6 +57,7 @@ fn convert_dicom_file(
     header_only: bool,
     hash_pixel_data: bool,
     overrides: Option<&HashMap<String, String>>,
+    snake_case: bool,
 ) -> Result<PathBuf, DicomConversionError> {
     // Open and apply any overrides
     let mut dicom = open_dicom(file, header_only && !hash_pixel_data)?;
@@ -126,8 +127,14 @@ fn convert_dicom_file(
     std::fs::create_dir_all(output_file.parent().unwrap())?;
 
     // Run the conversion
-    dicom_to_parquet(&dicom, &output_file, header_only, hash_pixel_data)
-        .map_err(|e| DicomConversionError::Other(e.to_string()))?;
+    dicom_to_parquet(
+        &dicom,
+        &output_file,
+        header_only,
+        hash_pixel_data,
+        snake_case,
+    )
+    .map_err(|e| DicomConversionError::Other(e.to_string()))?;
     Ok(output_file)
 }
 
@@ -138,6 +145,7 @@ fn convert_dicom_files<'a>(
     header_only: bool,
     hash_pixel_data: bool,
     overrides: Option<&HashMap<String, String>>,
+    snake_case: bool,
 ) -> Vec<PathBuf> {
     // Prepare args
     let header_only = header_only;
@@ -158,7 +166,14 @@ fn convert_dicom_files<'a>(
     files
         .into_par_iter()
         .filter_map(move |file| {
-            match convert_dicom_file(file, &output_dir, header_only, hash_pixel_data, overrides) {
+            match convert_dicom_file(
+                file,
+                &output_dir,
+                header_only,
+                hash_pixel_data,
+                overrides,
+                snake_case,
+            ) {
                 Ok(r) => Some(r),
                 Err(e) => {
                     warn!("Failed to convert DICOM file {}", e);
@@ -195,6 +210,14 @@ struct Args {
 
     #[arg(short='t', long = "tag", value_parser = parse_key_val::<String, String>)]
     tags: Vec<(String, String)>,
+
+    #[arg(
+        short = 's',
+        long = "snake-case",
+        help = "Convert DICOM tag names to snake case",
+        action = clap::ArgAction::SetTrue
+    )]
+    snake_case: bool,
 }
 
 // Parse a single key-value pair
@@ -220,6 +243,7 @@ fn run(args: Args) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     info!("Header only: {:?}", args.header_only);
     info!("Hash: {:?}", args.hash);
     info!("Tags: {:?}", args.tags);
+    info!("Snake case: {:?}", args.snake_case);
 
     if !args.output_dir.exists() {
         error!("Output directory does not exist: {:?}", args.output_dir);
@@ -252,6 +276,7 @@ fn run(args: Args) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
         args.header_only,
         args.hash,
         overrides,
+        args.snake_case,
     );
 
     let end = Instant::now();
@@ -293,6 +318,7 @@ mod tests {
             header_only: false,
             hash: true,
             tags: vec![],
+            snake_case: true,
         };
         run(args).unwrap(); // Assuming `main` is adapted to take `Args` struct
 

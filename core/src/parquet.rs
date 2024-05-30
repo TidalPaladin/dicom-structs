@@ -27,6 +27,53 @@ use std::sync::Arc;
 
 pub type DicomElement = DataElement<InMemDicomObject>;
 
+/// Convert a DICOM tag name to snake case
+///
+/// # Arguments
+///
+/// * `s` - A reference to a string
+///
+/// # Returns
+///
+/// * A string in snake case
+///
+/// # Examples
+///
+/// ```
+/// use dicom_structs_core::parquet::snake_case;
+/// let s = "SOPInstanceUID";
+/// let expected = "sop_instance_uid";
+/// let result = snake_case(s);
+/// assert_eq!(result, expected);
+///
+/// let s = "StudyInstanceUID";
+/// let expected = "study_instance_uid";
+/// let result = snake_case(s);
+/// assert_eq!(result, expected);
+/// ```
+pub fn snake_case(s: &str) -> String {
+    // This Regex works well and is much simpler, but lookaround is not currently supported
+    //let re = Regex::new(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])").unwrap();
+    let mut result = Vec::new();
+    let mut current = String::new();
+    let chars: Vec<char> = s.chars().collect();
+
+    current.push(chars[0]);
+
+    for i in 1..chars.len() {
+        if chars[i].is_uppercase()
+            && (chars[i - 1].is_lowercase() || (i < chars.len() - 1 && chars[i + 1].is_lowercase()))
+        {
+            result.push(current.clone());
+            current.clear();
+        }
+        current.push(chars[i]);
+    }
+
+    result.push(current);
+    result.join("_").to_lowercase()
+}
+
 pub trait ArrayWrap {
     /// Wrap the array in a list array of length 1
     fn wrap_as_list(&self) -> Self;
@@ -269,6 +316,7 @@ pub fn dicom_file_to_parquet(
     header_only: bool,
     hash_pixel_data: bool,
     overrides: Option<&HashMap<String, String>>,
+    snake_case: bool,
 ) -> Result<(), Error> {
     let mut obj =
         open_dicom(dicom_path, header_only && !hash_pixel_data).map_err(|e| Error::Whatever {
@@ -293,7 +341,7 @@ pub fn dicom_file_to_parquet(
         }
     }
 
-    dicom_to_parquet(&obj, parquet_path, header_only, hash_pixel_data)
+    dicom_to_parquet(&obj, parquet_path, header_only, hash_pixel_data, snake_case)
 }
 
 /// Hashes pixel data if required and writes DICOM data to a Parquet file.
@@ -308,6 +356,7 @@ pub fn dicom_file_to_parquet(
 /// * `parquet_path` - The file path where the Parquet file will be saved.
 /// * `header_only` - If true, only DICOM headers are processed; otherwise, full data is processed.
 /// * `hash_pixel_data` - If true, pixel data is hashed for additional processing.
+/// * `snake_case` - If true, DICOM tag names are converted to snake case.
 ///
 /// # Returns
 ///
@@ -322,6 +371,7 @@ pub fn dicom_to_parquet(
     parquet_path: &Path,
     header_only: bool,
     hash_pixel_data: bool,
+    snake_case: bool,
 ) -> Result<(), Error> {
     // Allocate containers to hold Parquet fields and arrays
     let mut fields = vec![];
@@ -350,6 +400,12 @@ pub fn dicom_to_parquet(
             .by_tag(header.tag)
             .map_or_else(|| header.tag.to_string(), |t| t.alias().to_string());
 
+        // Convert to snake case
+        let tag_name = match snake_case {
+            true => self::snake_case(&tag_name),
+            false => tag_name,
+        };
+
         let nullable =
             header.tag != tags::SOP_INSTANCE_UID && header.tag != tags::STUDY_INSTANCE_UID;
 
@@ -376,9 +432,13 @@ pub fn dicom_to_parquet(
 
         // Add the hashed pixel data to the schema and arrays
         if has_pixel_data {
+            let hash_tag_name = match snake_case {
+                true => "pixel_data_hash".to_string(),
+                false => "PixelDataHash".to_string(),
+            };
             let hashed_pixel_data =
                 crate::dicom::hash_pixel_data(dicom).map_err(|_| Error::PixelHashError)?;
-            fields.push(Field::new("PixelDataHash", DataType::UInt64, true));
+            fields.push(Field::new(hash_tag_name, DataType::UInt64, true));
             arrays.push(Arc::new(UInt64Array::from(vec![hashed_pixel_data])) as ArrayRef);
         }
     }
@@ -439,7 +499,7 @@ mod tests {
     use rstest::rstest;
     use std::collections::HashMap;
 
-    use super::dicom_file_to_parquet;
+    use super::{dicom_file_to_parquet, snake_case};
 
     use std::fs::File;
 
@@ -458,8 +518,15 @@ mod tests {
 
         // Convert to parquet
         let parquet_file_path = tempfile::NamedTempFile::new().unwrap();
-        dicom_file_to_parquet(&dicom_file_path, parquet_file_path.path(), true, true, None)
-            .unwrap();
+        dicom_file_to_parquet(
+            &dicom_file_path,
+            parquet_file_path.path(),
+            true,
+            true,
+            None,
+            false,
+        )
+        .unwrap();
 
         // Read parquet
         let parquet_file = File::open(parquet_file_path).unwrap();
@@ -501,6 +568,7 @@ mod tests {
             header_only,
             true,
             None,
+            false,
         )
         .unwrap();
 
@@ -557,6 +625,7 @@ mod tests {
             false,
             false,
             Some(&overrides),
+            false,
         )
         .unwrap();
 
@@ -589,6 +658,7 @@ mod tests {
             false,
             false,
             None,
+            false,
         )
         .unwrap();
 
@@ -621,6 +691,7 @@ mod tests {
             header_only,
             hash_pixel_data,
             None,
+            false,
         )
         .unwrap();
 
@@ -664,7 +735,76 @@ mod tests {
         let dicom_file_path = dicom_test_files::path(dicom_file_name).unwrap();
         let parquet_file_path = tempfile::NamedTempFile::new().unwrap();
         let parquet_file_path = parquet_file_path.path();
-        dicom_file_to_parquet(&dicom_file_path, parquet_file_path, false, true, None).unwrap();
+        dicom_file_to_parquet(
+            &dicom_file_path,
+            parquet_file_path,
+            false,
+            true,
+            None,
+            false,
+        )
+        .unwrap();
         assert!(parquet_file_path.is_file());
+    }
+
+    #[rstest]
+    #[case("SOPInstanceUID", "sop_instance_uid")]
+    #[case("StudyInstanceUID", "study_instance_uid")]
+    #[case("TransferSyntaxUID", "transfer_syntax_uid")]
+    #[case("FrameOfReferenceUID", "frame_of_reference_uid")]
+    #[case("ThisUIDString", "this_uid_string")]
+    fn test_snake_case(#[case] input: &str, #[case] expected: &str) {
+        let result = snake_case(input);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_snake_case_conversion() {
+        let dicom_file_path = dicom_test_files::path("pydicom/SC_rgb.dcm").unwrap();
+        let obj = OpenFileOptions::new()
+            .open_file(dicom_file_path.clone())
+            .unwrap();
+        let expected = obj
+            .element_by_name("SOPInstanceUID")
+            .unwrap()
+            .value()
+            .to_str();
+
+        // Convert to parquet
+        let parquet_file_path = tempfile::NamedTempFile::new().unwrap();
+        dicom_file_to_parquet(
+            &dicom_file_path,
+            parquet_file_path.path(),
+            true,
+            true,
+            None,
+            true,
+        )
+        .unwrap();
+
+        // Read parquet
+        let parquet_file = File::open(parquet_file_path).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(parquet_file).unwrap();
+        let mut reader = builder.build().unwrap();
+        let batch = reader.next().unwrap().unwrap();
+
+        // Check SOPInstanceUID
+        let column = batch.column(batch.schema().index_of("sop_instance_uid").unwrap());
+        let sop_instance_uid = column
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0);
+        assert_eq!(sop_instance_uid, expected.unwrap());
+
+        // Test PixelDataHash
+        let column = batch.column(batch.schema().index_of("pixel_data_hash").unwrap());
+        let expected_hash = 10240938377863354873_u64;
+        let hash = column
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(hash, expected_hash);
     }
 }
