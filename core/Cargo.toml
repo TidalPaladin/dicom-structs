@@ -12,7 +12,6 @@ parquet = "51.0.0"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 log = "0.4"
 snafu = "0.8"
-regex = "1.10"
 
 [dev-dependencies]
 tempfile = "3.10"
