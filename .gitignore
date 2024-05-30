@@ -140,3 +140,4 @@ coverage.xml
 .pdm-python
 .vscode/*.code-workspace
 tmp/*
+**/*.parquet
