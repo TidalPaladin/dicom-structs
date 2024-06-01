@@ -811,6 +811,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "dicom-symlink"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "dicom",
+ "dicom-structs-core",
+ "dicom-test-files",
+ "env_logger",
+ "indicatif",
+ "log",
+ "rayon",
+ "rust_search",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "dicom-test-files"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

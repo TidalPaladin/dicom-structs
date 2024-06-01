@@ -9,6 +9,7 @@ members = [
     "core",
     "dicom-to-parquet",
     "collect-parquet",
+    "dicom-symlink",
 ]
 
 #[dependencies]
