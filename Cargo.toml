@@ -11,6 +11,7 @@ members = [
     "collect-parquet",
     "dicom-symlink",
 ]
+resolver = "2"
 
 #[dependencies]
 #dicom = "0.7.0"

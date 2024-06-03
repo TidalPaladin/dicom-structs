@@ -30,7 +30,11 @@ fn find_dicom_files(dir: &PathBuf) -> impl Iterator<Item = PathBuf> {
         .filter(move |file| is_dicom_file(file, false) && file.is_file())
 }
 
-fn symlink_dicom_file(file: &PathBuf, output_dir: &PathBuf) -> Result<PathBuf, Error> {
+fn symlink_dicom_file(
+    file: &PathBuf,
+    output_dir: &PathBuf,
+    resolve: bool,
+) -> Result<PathBuf, Error> {
     // Open and read
     let dicom = open_dicom(file, true)?;
 
@@ -102,12 +106,28 @@ fn symlink_dicom_file(file: &PathBuf, output_dir: &PathBuf) -> Result<PathBuf, E
     // Create parent directories if they don't exist
     std::fs::create_dir_all(output_file.parent().unwrap())?;
 
+    // If the source file is a symlink, resolve it first
+    let file = if resolve {
+        file.canonicalize()?
+    } else {
+        file.clone()
+    };
+
     symlink(file, output_file.clone())?;
+    assert!(
+        output_file.is_symlink(),
+        "Output file {:?} is not a symlink",
+        output_file
+    );
     Ok(output_file)
 }
 
 /// Create symlinks for all DICOM files
-fn symlink_dicom_files<'a>(files: Vec<&'a PathBuf>, output_dir: &'a PathBuf) -> Vec<PathBuf> {
+fn symlink_dicom_files<'a>(
+    files: Vec<&'a PathBuf>,
+    output_dir: &'a PathBuf,
+    resolve: bool,
+) -> Vec<PathBuf> {
     // Prepare args
     let output_dir = output_dir.canonicalize().unwrap();
 
@@ -125,13 +145,15 @@ fn symlink_dicom_files<'a>(files: Vec<&'a PathBuf>, output_dir: &'a PathBuf) -> 
     // Parallel map symlink_dicom_file to each file
     files
         .into_par_iter()
-        .filter_map(move |file| match symlink_dicom_file(file, &output_dir) {
-            Ok(r) => Some(r),
-            Err(e) => {
-                warn!("Failed to symlink DICOM file {}", e);
-                None
-            }
-        })
+        .filter_map(
+            move |file| match symlink_dicom_file(file, &output_dir, resolve) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    warn!("Failed to symlink DICOM file {}", e);
+                    None
+                }
+            },
+        )
         .progress_with(pb)
         .collect()
 }
@@ -148,12 +170,16 @@ struct Args {
 
     #[arg(help = "Directory to write outputs to")]
     output_dir: PathBuf,
+
+    #[arg(help = "Resolve symlinks in the source directory")]
+    resolve: bool,
 }
 
 fn run(args: Args) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     info!("Starting DICOM file symlinker");
     info!("Source directory: {:?}", args.source_dir);
     info!("Output directory: {:?}", args.output_dir);
+    info!("Resolve symlinks: {:?}", args.resolve);
 
     if !args.output_dir.exists() {
         error!("Output directory does not exist: {:?}", args.output_dir);
@@ -174,15 +200,15 @@ fn run(args: Args) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let start = Instant::now();
     let dicom_files: Vec<_> = find_dicom_files(&args.source_dir).collect();
     let dicom_files = dicom_files.iter().collect();
-    let parquet_files = symlink_dicom_files(dicom_files, &args.output_dir);
+    let output_symlinks = symlink_dicom_files(dicom_files, &args.output_dir, args.resolve);
 
     let end = Instant::now();
     info!(
-        "Converted {:?} files in {:?}",
-        parquet_files.len(),
+        "Linked {:?} files in {:?}",
+        output_symlinks.len(),
         end.duration_since(start)
     );
-    Ok(parquet_files)
+    Ok(output_symlinks)
 }
 
 fn main() {
@@ -193,7 +219,9 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{run, Args};
+    use super::{run, symlink_dicom_file, Args};
+    use std::fs;
+    use std::os::unix::fs::symlink;
 
     #[test]
     fn test_main() {
@@ -212,6 +240,7 @@ mod tests {
         let args = Args {
             source_dir: temp_dir.path().to_path_buf(),
             output_dir: output_dir.path().to_path_buf(),
+            resolve: false,
         };
         run(args).unwrap(); // Assuming `main` is adapted to take `Args` struct
 
@@ -220,6 +249,31 @@ mod tests {
         assert!(
             output_files.count() > 0,
             "No files were created in the output directory."
+        );
+    }
+
+    #[test]
+    fn test_symlink_inputs_resolved() {
+        // Create a temporary directory to hold the symlink
+        let temp_dir = tempfile::tempdir().unwrap();
+        let symlink_path = temp_dir.path().join("symlink.dcm");
+
+        // Create a symlink to the DICOM file
+        let dicom_file_path = dicom_test_files::path("pydicom/SC_rgb.dcm").unwrap();
+        symlink(&dicom_file_path, &symlink_path).unwrap();
+
+        // Create a temporary directory to hold the output
+        let output_dir = tempfile::tempdir().unwrap();
+
+        // Run the main function
+        let output_symlink =
+            symlink_dicom_file(&symlink_path, &output_dir.path().to_path_buf(), true).unwrap();
+
+        // Check that the symlink in the output directory points to the original DICOM file
+        let resolved_path = fs::read_link(output_symlink).unwrap();
+        assert_eq!(
+            resolved_path, dicom_file_path,
+            "Symlink does not resolve to the original DICOM file."
         );
     }
 }
