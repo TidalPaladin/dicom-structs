@@ -1,5 +1,5 @@
 use arrow::array::RecordBatch;
-use arrow::compute::{cast, concat_batches};
+use arrow::compute::cast;
 use arrow::datatypes::Schema;
 use arrow::error::ArrowError;
 use clap::Parser;
@@ -8,14 +8,15 @@ use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
 use log::{info, warn};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::arrow_writer::ArrowWriter;
-use parquet::basic::Compression;
+use parquet::arrow::parquet_to_arrow_schema;
+use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
+use parquet::file::reader::{FileReader, SerializedFileReader};
 use rayon::prelude::*;
 use rust_search::SearchBuilder;
-use std::collections::HashMap;
 use std::fs::File;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// Find the files to be processed with a progress bar
@@ -40,6 +41,19 @@ fn find_parquet_files(dir: &PathBuf) -> impl Iterator<Item = PathBuf> {
         .filter(move |file| file.is_file())
 }
 
+/// Read only the schema from a parquet file
+fn read_parquet_schema(
+    path: &PathBuf,
+) -> Result<Schema, Box<dyn std::error::Error + Send + Sync + 'static>> {
+    let file = File::open(path)?;
+    let reader = SerializedFileReader::new(file).unwrap();
+    let metadata = reader.metadata();
+    let schema_descriptor = metadata.file_metadata().schema_descr_ptr();
+    let key_value_metadata = metadata.file_metadata().key_value_metadata();
+    let schema = parquet_to_arrow_schema(&schema_descriptor, key_value_metadata).unwrap();
+    Ok(schema)
+}
+
 /// Read a single Parquet file
 fn read_parquet(
     path: &PathBuf,
@@ -60,57 +74,52 @@ fn read_parquet(
     Ok(batch)
 }
 
-fn create_schema(batches: &Vec<RecordBatch>) -> Result<Schema, Error> {
-    // Extract schemas from each batch
-    let schemas: Vec<_> = batches
-        .iter()
-        .map(|b| Schema::new(b.schema().fields().clone()))
-        .collect();
+/// Create a schema from a vector of parquet file paths
+fn create_schema(paths: &Vec<PathBuf>) -> Result<Schema, Error> {
+    if paths.is_empty() {
+        return Err(Error::Whatever {
+            message: "No parquet files found".to_string(),
+            source: None,
+        });
+    }
 
-    //all fields that are nested in at least one record
-    let nested_fields = schemas
-        .iter()
-        .flat_map(|s| s.fields().iter())
-        .filter(|f| f.data_type().is_nested())
-        .map(|f| (f.name(), f))
-        .collect::<HashMap<_, _>>();
-
-    // Update the schemas, removing any fields that are nested in at least one record
-    let schemas: Vec<_> = schemas
-        .iter()
-        .map(|s| {
-            let keep_fields: Vec<_> = s
-                .fields()
-                .iter()
-                .filter(|f| !nested_fields.contains_key(f.name()))
-                .map(|f| f.clone())
-                .collect();
-            Schema::new(keep_fields)
-        })
-        .collect();
-
-    // Merge the non-nested fields
-    let merged_schema = Schema::try_merge(schemas).map_err(|e| Error::Whatever {
-        message: format!("Failed to merge schemas: {}", e),
-        source: Some(Box::new(e)),
-    })?;
-
-    // Merge with the nested fields
-    let nested_schema = Schema::new(
-        nested_fields
-            .into_values()
-            .map(|f| f.clone())
-            .collect::<Vec<_>>(),
+    // Create progress bar
+    let pb = ProgressBar::new(paths.len() as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "{msg} {spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta} @ {per_sec})",
+            )
+            .unwrap(),
     );
-    println!("Nested schema: {:?}", nested_schema);
-    Ok(
-        Schema::try_merge(vec![merged_schema, nested_schema]).map_err(|e| Error::Whatever {
-            message: format!("Failed to merge schemas: {}", e),
-            source: Some(Box::new(e)),
-        })?,
-    )
+    pb.set_message("Determining schema from parquet files");
+
+    // Read the schemas from the parquet files and aggregate them
+    let acc = read_parquet_schema(&paths[0]).unwrap();
+    let result = paths
+        .par_iter()
+        .progress_with(pb)
+        .filter_map(|p| match read_parquet_schema(p) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                warn!("Failed to read schema from Parquet file {}", e);
+                None
+            }
+        })
+        .reduce(
+            || acc.clone(),
+            |acc, s| match Schema::try_merge(vec![acc.clone(), s]) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("Failed to merge schemas: {}", e);
+                    acc
+                }
+            },
+        );
+    Ok(result)
 }
 
+/// Cast a record to a schema
 fn cast_record_to_schema(record: &RecordBatch, schema: &Schema) -> Result<RecordBatch, Error> {
     // Cast every column in record to match the schema
     let casted_columns = schema
@@ -151,9 +160,31 @@ fn cast_record_to_schema(record: &RecordBatch, schema: &Schema) -> Result<Record
     Ok(batch)
 }
 
-/// Collect multiple parquet files into a single RecordBatch
-fn collect_parquet_files(paths: Vec<PathBuf>) -> Result<RecordBatch, Error> {
-    // Create progress bar
+/// Get the path to a shard file
+#[inline]
+fn shard_path(path: &PathBuf, index: usize) -> PathBuf {
+    let shard_extension = format!("{:05}.parquet", index);
+    path.with_extension("").with_extension(shard_extension)
+}
+
+/// Opens a new shard file
+#[inline]
+fn open_output_shard(path: &PathBuf, index: usize) -> Result<File, Error> {
+    let shard_path = shard_path(path, index);
+    File::create(shard_path).map_err(|e| Error::Whatever {
+        message: format!("Failed to create output file: {}", e),
+        source: Some(Box::new(e)),
+    })
+}
+
+/// Collect multiple parquet files and write them to an output path
+fn collect_parquet_files(
+    paths: &Vec<PathBuf>,
+    output_path: PathBuf,
+    schema: &Schema,
+    props: WriterProperties,
+    shard_size: usize,
+) -> Result<Vec<PathBuf>, Error> {
     let pb = ProgressBar::new(paths.len() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
@@ -162,11 +193,12 @@ fn collect_parquet_files(paths: Vec<PathBuf>) -> Result<RecordBatch, Error> {
             )
             .unwrap(),
     );
-    pb.set_message("Aggregating Parquet files");
+    pb.set_message("Processing Parquet files");
 
-    // Parallel map to open each Parquet file
-    let batches = paths
+    // Parallel map to open each Parquet file and convert to shared schema
+    let record_iter = paths
         .into_par_iter()
+        .progress_with(pb)
         .filter_map(move |file| match read_parquet(&file) {
             Ok(r) => Some(r),
             Err(e) => {
@@ -174,47 +206,63 @@ fn collect_parquet_files(paths: Vec<PathBuf>) -> Result<RecordBatch, Error> {
                 None
             }
         })
-        .progress_with(pb)
-        .collect::<Vec<RecordBatch>>();
+        .filter_map(|batch| match cast_record_to_schema(&batch, schema) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                warn!("Failed to convert Parquet file {} to shared schema", e);
+                None
+            }
+        });
 
-    // Merge schemas from each record
-    info!("Creating schema");
-    let schema = create_schema(&batches)?;
-    info!("Aggregated schema with {} fields", schema.fields().len());
-    schema.fields().iter().for_each(|f| {
-        info!(
-            "Field: {:?} ({:?}, {:?})",
-            f.name(),
-            f.data_type(),
-            f.is_nullable()
-        )
-    });
+    let shard_size_bytes = shard_size * (1e6 as usize);
+    let shard_paths = Arc::new(Mutex::new(vec![shard_path(&output_path, 0)]));
+    let current_file_index = Arc::new(Mutex::new(0_usize));
+    let current_file = open_output_shard(&output_path, 0)?;
+    let arrow_writer = Arc::new(Mutex::new(Some(
+        ArrowWriter::try_new(current_file, Arc::new(schema.clone()), Some(props.clone())).map_err(
+            |e| Error::Whatever {
+                message: format!("Failed to create struct array: {}", e),
+                source: Some(Box::new(e)),
+            },
+        )?,
+    )));
 
-    // Cast all records to match the aggregate schema
-    let pb = ProgressBar::new(batches.len() as u64);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template(
-                "{msg} {spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta} @ {per_sec})",
-            )
-            .unwrap(),
-    );
-    pb.set_message("Converting records to shared schema");
-    let batches = batches
-        .par_iter()
-        .map(|batch| cast_record_to_schema(&batch, &schema))
-        .progress_with(pb)
-        .collect::<Result<Vec<_>, _>>()?;
+    // Processing data with Rayon
+    record_iter.try_for_each(|record| {
+        // Lock the writer and current file idx
+        let mut guard = arrow_writer.lock().unwrap();
+        let mut writer = guard.take().unwrap();
+        let mut idx = current_file_index.lock().unwrap();
 
-    info!(
-        "Concatenating {} batches, this may take some time",
-        batches.len()
-    );
-    let batch = concat_batches(&Arc::new(schema), batches.iter()).map_err(|e| Error::Whatever {
-        message: format!("Failed to concatenate batches: {}", e),
-        source: Some(Box::new(e)),
+        // Perform the write
+        let result = writer.write(&record).map_err(|e| Error::Whatever {
+            message: format!("Failed to write batch: {}", e),
+            source: Some(Box::new(e)),
+        });
+        writer.flush().unwrap();
+
+        // Check if the current file needs to be rotated
+        if writer.bytes_written() >= shard_size_bytes {
+            // Close the current writer
+            writer.close().unwrap();
+
+            // Update file index and create a new writer
+            *idx += 1;
+            shard_paths
+                .lock()
+                .unwrap()
+                .push(shard_path(&output_path, *idx));
+            let current_file = open_output_shard(&output_path, *idx).unwrap();
+            writer =
+                ArrowWriter::try_new(current_file, Arc::new(schema.clone()), Some(props.clone()))
+                    .unwrap();
+        }
+        *guard = Some(writer);
+        result
     })?;
-    Ok(batch)
+
+    let result = shard_paths.lock().unwrap().clone();
+    Ok(result)
 }
 
 #[derive(Parser, Debug)]
@@ -225,55 +273,73 @@ struct Args {
 
     #[arg(help = "Path to write output to")]
     output_path: PathBuf,
+
+    #[arg(
+        short = 's',
+        long = "shard-size",
+        help = "Size of each Parquet output shard in MB",
+        default_value = "128"
+    )]
+    shard_size: usize,
+
+    #[arg(
+        short = 'c',
+        long = "compression-level",
+        help = "ZSTD compression level",
+        default_value = "6",
+        value_parser = clap::value_parser!(i32).range(1..=22)
+    )]
+    compression_level: i32,
 }
 
-fn run(args: Args) -> Result<RecordBatch, Error> {
+fn run(args: Args) -> Result<Vec<PathBuf>, Error> {
     info!("Starting Parquet file aggregator");
     info!("Source directory: {:?}", args.source_dir);
     info!("Output path: {:?}", args.output_path);
+    info!("Shard size: {:?}MB", args.shard_size);
+    info!("ZSTD compression level: {:?}", args.compression_level);
     let start = Instant::now();
 
     // Find the parquet files
     let parquet_files: Vec<_> = find_parquet_files(&args.source_dir).collect();
     println!("Found {:?} parquet files", parquet_files.len());
 
-    // Collect the parquet files into a single batch
-    let batch = collect_parquet_files(parquet_files)?;
-    let schema = batch.schema();
+    // Determine the schema from the parquet files
+    info!("Determining schema from parquet files");
+    let schema = create_schema(&parquet_files)?;
+    for (i, f) in schema.fields().iter().enumerate() {
+        info!(
+            "Field {}: {:?} ({:?}, {:?})",
+            i,
+            f.name(),
+            f.data_type(),
+            f.is_nullable()
+        );
+    }
 
-    // Set compression to SNAPPY
+    // Set compression to Zstd
     let props = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
+        .set_compression(Compression::ZSTD(
+            ZstdLevel::try_new(args.compression_level).unwrap(),
+        ))
         .build();
 
-    // Setup the writer
-    let file = File::create(args.output_path).map_err(|e| Error::Whatever {
-        message: format!("Failed to create output file: {}", e),
-        source: Some(Box::new(e)),
-    })?;
-    let mut arrow_writer =
-        ArrowWriter::try_new(file, schema.clone(), Some(props)).map_err(|e| Error::Whatever {
-            message: format!("Failed to create struct array: {}", e),
-            source: Some(Box::new(e)),
-        })?;
-
-    // Run write op
-    arrow_writer.write(&batch).map_err(|e| Error::Whatever {
-        message: format!("Failed to write batch: {}", e),
-        source: Some(Box::new(e)),
-    })?;
-    arrow_writer.close().map_err(|e| Error::Whatever {
-        message: format!("Failed to close writer: {}", e),
-        source: Some(Box::new(e)),
-    })?;
+    // Run the collection
+    let shard_paths = collect_parquet_files(
+        &parquet_files,
+        args.output_path,
+        &schema,
+        props,
+        args.shard_size,
+    )?;
 
     let end = Instant::now();
     info!(
         "Aggregated {:?} files in {:?}",
-        batch.num_rows(),
+        parquet_files.len(),
         end.duration_since(start)
     );
-    Ok(batch)
+    Ok(shard_paths)
 }
 
 fn main() {
@@ -285,10 +351,12 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{run, Args};
+    use crate::create_schema;
     use dicom_structs_core::parquet::dicom_file_to_parquet;
+    use std::path::Path;
+    use std::path::PathBuf;
 
-    #[test]
-    fn test_main() {
+    fn setup_test_files(parquet_dir: &Path) -> (PathBuf, PathBuf) {
         let dicom_path_1 = dicom_test_files::path("pydicom/SC_rgb.dcm").unwrap();
         let dicom_path_2 = dicom_test_files::path("pydicom/CT_small.dcm").unwrap();
 
@@ -300,9 +368,8 @@ mod tests {
         std::fs::copy(&dicom_path_2, &temp_dicom_path_2).unwrap();
 
         // Create a temp directory and convert the DICOMs to parquet
-        let parquet_dir = tempfile::tempdir().unwrap();
-        let parquet_path_1 = parquet_dir.path().join("SC_rgb.parquet");
-        let parquet_path_2 = parquet_dir.path().join("CT_small.parquet");
+        let parquet_path_1 = parquet_dir.join("SC_rgb.parquet");
+        let parquet_path_2 = parquet_dir.join("CT_small.parquet");
         dicom_file_to_parquet(
             &temp_dicom_path_1,
             &parquet_path_1.to_path_buf(),
@@ -312,6 +379,7 @@ mod tests {
             true,
         )
         .unwrap();
+        assert!(parquet_path_1.is_file());
         dicom_file_to_parquet(
             &temp_dicom_path_2,
             &parquet_path_2.to_path_buf(),
@@ -321,17 +389,44 @@ mod tests {
             true,
         )
         .unwrap();
+        assert!(parquet_path_2.is_file());
+        (parquet_path_1, parquet_path_2)
+    }
 
-        let output_path = parquet_dir.path().join("output.parquet");
+    #[test]
+    fn test_create_schema() {
+        let parquet_dir = tempfile::tempdir().unwrap();
+        let (parquet_path_1, parquet_path_2) = setup_test_files(&parquet_dir.path());
+        let paths = vec![parquet_path_1, parquet_path_2];
+        let schema = create_schema(&paths).unwrap();
+        assert!(schema.fields().len() == 249);
+    }
+
+    #[test]
+    fn test_main() {
+        let parquet_dir = tempfile::tempdir().unwrap();
+        setup_test_files(&parquet_dir.path());
+        let source_dir = parquet_dir.path();
+
+        let output_path = source_dir.join("output.parquet");
 
         // Run the main function
         let args = Args {
-            source_dir: temp_dir.path().to_path_buf(),
+            source_dir: source_dir.to_path_buf(),
             output_path: output_path.to_path_buf(),
+            shard_size: 128,
+            compression_level: 3,
         };
-        run(args).unwrap(); // Assuming `main` is adapted to take `Args` struct
+        let output_files = run(args).unwrap();
 
         // Check that an output Parquet file was created
-        assert!(output_path.is_file(), "Parquet file not created.");
+        assert!(output_files.len() == 1);
+        for file in output_files {
+            assert!(
+                file.is_file(),
+                "Parquet file {} not created.",
+                file.display()
+            );
+        }
     }
 }

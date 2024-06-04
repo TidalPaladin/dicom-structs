@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 arrow = "51.0.0"
-parquet = "51.0.0"
+parquet = { version = "51.0.0", features = ["arrow", "async", "zstd"] }
 log = "0.4"
 indicatif = { version= "0.17", features= ["rayon"] }
 clap = { version = "4.5", features = ["derive"] }
