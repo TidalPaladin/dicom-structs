@@ -1,8 +1,9 @@
 use arrow::array::RecordBatch;
-use arrow::compute::cast;
+use arrow::compute::{cast, concat_batches};
 use arrow::datatypes::Schema;
 use arrow::error::ArrowError;
 use clap::Parser;
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use dicom_structs_core::error::Error;
 use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
 use log::{info, warn};
@@ -16,7 +17,8 @@ use rayon::prelude::*;
 use rust_search::SearchBuilder;
 use std::fs::File;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Find the files to be processed with a progress bar
@@ -177,13 +179,51 @@ fn open_output_shard(path: &PathBuf, index: usize) -> Result<File, Error> {
     })
 }
 
+/// Write a single shard
+fn write_shard(
+    output_path: &PathBuf,
+    shard_idx: usize,
+    processed_items: &Vec<RecordBatch>,
+    schema: &Schema,
+    props: &WriterProperties,
+) -> Result<PathBuf, Error> {
+    // Create a new shard file
+    let shard_file = open_output_shard(output_path, shard_idx).unwrap();
+    let mut writer =
+        ArrowWriter::try_new(shard_file, Arc::new(schema.clone()), Some(props.clone())).map_err(
+            |e| Error::Whatever {
+                message: format!("Failed to create struct array: {}", e),
+                source: Some(Box::new(e)),
+            },
+        )?;
+
+    // Concatenate records from this shard
+    let batch = concat_batches(&Arc::new(schema.clone()), processed_items.iter()).map_err(|e| {
+        Error::Whatever {
+            message: format!("Failed to concatenate batches: {}", e),
+            source: Some(Box::new(e)),
+        }
+    })?;
+
+    // Write the batch to the shard
+    writer.write(&batch).map_err(|e| Error::Whatever {
+        message: format!("Failed to write batch: {}", e),
+        source: Some(Box::new(e)),
+    })?;
+    writer.close().map_err(|e| Error::Whatever {
+        message: format!("Failed to close writer: {}", e),
+        source: Some(Box::new(e)),
+    })?;
+    Ok(shard_path(output_path, shard_idx))
+}
+
 /// Collect multiple parquet files and write them to an output path
 fn collect_parquet_files(
     paths: &Vec<PathBuf>,
     output_path: PathBuf,
     schema: &Schema,
     props: WriterProperties,
-    shard_size: usize,
+    shard_size_mb: usize,
 ) -> Result<Vec<PathBuf>, Error> {
     let pb = ProgressBar::new(paths.len() as u64);
     pb.set_style(
@@ -195,8 +235,12 @@ fn collect_parquet_files(
     );
     pb.set_message("Processing Parquet files");
 
-    // Parallel map to open each Parquet file and convert to shared schema
-    let record_iter = paths
+    let cumulative_size = AtomicUsize::new(0);
+    let (sender, receiver): (Sender<(usize, RecordBatch)>, Receiver<(usize, RecordBatch)>) =
+        unbounded();
+
+    // Parallel map to open each Parquet file, convert to shared schema, and send to receiver with a shard index
+    paths
         .into_par_iter()
         .progress_with(pb)
         .filter_map(move |file| match read_parquet(&file) {
@@ -212,57 +256,53 @@ fn collect_parquet_files(
                 warn!("Failed to convert Parquet file {} to shared schema", e);
                 None
             }
+        })
+        .for_each_with(sender, |s, record| {
+            let current_size =
+                cumulative_size.fetch_add(record.get_array_memory_size(), Ordering::SeqCst);
+            // TODO: This is computed from uncompressed data. As a result we get shards that are much smaller than the specified size.
+            // See if there is a way to determine size directly from the compressed / written data without breaking parallelism.
+            let shard_idx = current_size / (shard_size_mb * (1e6 as usize));
+            s.send((shard_idx, record)).expect("Failed to send item");
         });
 
-    let shard_size_bytes = shard_size * (1e6 as usize);
-    let shard_paths = Arc::new(Mutex::new(vec![shard_path(&output_path, 0)]));
-    let current_file_index = Arc::new(Mutex::new(0_usize));
-    let current_file = open_output_shard(&output_path, 0)?;
-    let arrow_writer = Arc::new(Mutex::new(Some(
-        ArrowWriter::try_new(current_file, Arc::new(schema.clone()), Some(props.clone())).map_err(
-            |e| Error::Whatever {
-                message: format!("Failed to create struct array: {}", e),
-                source: Some(Box::new(e)),
-            },
-        )?,
-    )));
+    // Define function to write a shard once we have enough data
+    let mut current_shard_idx = 0;
+    let mut processed_items = Vec::new();
+    let mut shards = Vec::new();
+    while let Ok((shard_idx, record)) = receiver.try_recv() {
+        if shard_idx != current_shard_idx {
+            // Write the shard
+            let output_path = write_shard(
+                &output_path,
+                current_shard_idx,
+                &processed_items,
+                schema,
+                &props,
+            )?;
+            shards.push(output_path);
 
-    // Processing data with Rayon
-    record_iter.try_for_each(|record| {
-        // Lock the writer and current file idx
-        let mut guard = arrow_writer.lock().unwrap();
-        let mut writer = guard.take().unwrap();
-        let mut idx = current_file_index.lock().unwrap();
-
-        // Perform the write
-        let result = writer.write(&record).map_err(|e| Error::Whatever {
-            message: format!("Failed to write batch: {}", e),
-            source: Some(Box::new(e)),
-        });
-        writer.flush().unwrap();
-
-        // Check if the current file needs to be rotated
-        if writer.bytes_written() >= shard_size_bytes {
-            // Close the current writer
-            writer.close().unwrap();
-
-            // Update file index and create a new writer
-            *idx += 1;
-            shard_paths
-                .lock()
-                .unwrap()
-                .push(shard_path(&output_path, *idx));
-            let current_file = open_output_shard(&output_path, *idx).unwrap();
-            writer =
-                ArrowWriter::try_new(current_file, Arc::new(schema.clone()), Some(props.clone()))
-                    .unwrap();
+            // Reset state for next shard
+            current_shard_idx += 1;
+            processed_items.clear();
+        } else {
+            processed_items.push(record);
         }
-        *guard = Some(writer);
-        result
-    })?;
+    }
 
-    let result = shard_paths.lock().unwrap().clone();
-    Ok(result)
+    // Write the last shard
+    if !processed_items.is_empty() {
+        let output_path = write_shard(
+            &output_path,
+            current_shard_idx,
+            &processed_items,
+            schema,
+            &props,
+        )?;
+        shards.push(output_path);
+    }
+
+    Ok(shards)
 }
 
 #[derive(Parser, Debug)]
