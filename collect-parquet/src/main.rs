@@ -3,7 +3,7 @@ use arrow::compute::{cast, concat_batches};
 use arrow::datatypes::Schema;
 use arrow::error::ArrowError;
 use clap::Parser;
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{bounded, Receiver, Sender};
 use dicom_structs_core::error::Error;
 use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
 use log::{info, warn};
@@ -17,9 +17,11 @@ use rayon::prelude::*;
 use rust_search::SearchBuilder;
 use std::fs::File;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::thread;
 use std::time::Instant;
+
+const CHANNEL_SIZE: usize = 1024;
 
 /// Find the files to be processed with a progress bar
 fn find_parquet_files(dir: &PathBuf) -> impl Iterator<Item = PathBuf> {
@@ -112,8 +114,8 @@ fn create_schema(paths: &Vec<PathBuf>) -> Result<Schema, Error> {
             || acc.clone(),
             |acc, s| match Schema::try_merge(vec![acc.clone(), s]) {
                 Ok(r) => r,
-                Err(e) => {
-                    warn!("Failed to merge schemas: {}", e);
+                Err(_) => {
+                    warn!("Failed to merge schemas");
                     acc
                 }
             },
@@ -210,6 +212,10 @@ fn write_shard(
         message: format!("Failed to write batch: {}", e),
         source: Some(Box::new(e)),
     })?;
+    writer.flush().map_err(|e| Error::Whatever {
+        message: format!("Failed to flush writer: {}", e),
+        source: Some(Box::new(e)),
+    })?;
     writer.close().map_err(|e| Error::Whatever {
         message: format!("Failed to close writer: {}", e),
         source: Some(Box::new(e)),
@@ -234,10 +240,66 @@ fn collect_parquet_files(
             .unwrap(),
     );
     pb.set_message("Processing Parquet files");
+    let (sender, receiver): (Sender<RecordBatch>, Receiver<RecordBatch>) = bounded(CHANNEL_SIZE);
 
-    let cumulative_size = AtomicUsize::new(0);
-    let (sender, receiver): (Sender<(usize, RecordBatch)>, Receiver<(usize, RecordBatch)>) =
-        unbounded();
+    // Receiver thread
+    let schema_clone = schema.clone();
+    let receiver_thread = thread::spawn(move || {
+        // Set up variables
+        let shard_idx = 0;
+        let mut shards = vec![shard_path(&output_path, shard_idx)];
+        let shard_file = open_output_shard(&output_path, shard_idx)?;
+        let mut writer = ArrowWriter::try_new(
+            shard_file,
+            Arc::new(schema_clone.clone()),
+            Some(props.clone()),
+        )
+        .map_err(|e| Error::Whatever {
+            message: format!("Failed to create struct array: {}", e),
+            source: Some(Box::new(e)),
+        })?;
+
+        // Take items from the sender
+        while let Ok(record) = receiver.recv() {
+            // If we have exceeded the shard size, set up a new writer
+            let need_new_shard = writer.in_progress_size() > shard_size_mb * (1024 * 1024)
+                || writer.in_progress_rows() > props.max_row_group_size();
+            if need_new_shard {
+                // Close the current writer
+                writer.close().map_err(|e| Error::Whatever {
+                    message: format!("Failed to close writer: {}", e),
+                    source: Some(Box::new(e)),
+                })?;
+
+                // Create a new writer
+                let shard_idx = shards.len();
+                shards.push(shard_path(&output_path, shard_idx));
+                let shard_file = open_output_shard(&output_path, shard_idx)?;
+                writer = ArrowWriter::try_new(
+                    shard_file,
+                    Arc::new(schema_clone.clone()),
+                    Some(props.clone()),
+                )
+                .map_err(|e| Error::Whatever {
+                    message: format!("Failed to create struct array: {}", e),
+                    source: Some(Box::new(e)),
+                })?;
+            }
+
+            // Write this item to the writer
+            writer.write(&record).map_err(|e| Error::Whatever {
+                message: format!("Failed to write batch: {}", e),
+                source: Some(Box::new(e)),
+            })?;
+        }
+
+        // Finalize the active writer
+        writer.close().map_err(|e| Error::Whatever {
+            message: format!("Failed to close writer: {}", e),
+            source: Some(Box::new(e)),
+        })?;
+        Ok(shards)
+    });
 
     // Parallel map to open each Parquet file, convert to shared schema, and send to receiver with a shard index
     paths
@@ -258,51 +320,11 @@ fn collect_parquet_files(
             }
         })
         .for_each_with(sender, |s, record| {
-            let current_size =
-                cumulative_size.fetch_add(record.get_array_memory_size(), Ordering::SeqCst);
-            // TODO: This is computed from uncompressed data. As a result we get shards that are much smaller than the specified size.
-            // See if there is a way to determine size directly from the compressed / written data without breaking parallelism.
-            let shard_idx = current_size / (shard_size_mb * (1e6 as usize));
-            s.send((shard_idx, record)).expect("Failed to send item");
+            s.send(record).expect("Failed to send item");
         });
 
-    // Define function to write a shard once we have enough data
-    let mut current_shard_idx = 0;
-    let mut processed_items = Vec::new();
-    let mut shards = Vec::new();
-    while let Ok((shard_idx, record)) = receiver.try_recv() {
-        if shard_idx != current_shard_idx {
-            // Write the shard
-            let output_path = write_shard(
-                &output_path,
-                current_shard_idx,
-                &processed_items,
-                schema,
-                &props,
-            )?;
-            shards.push(output_path);
-
-            // Reset state for next shard
-            current_shard_idx += 1;
-            processed_items.clear();
-        } else {
-            processed_items.push(record);
-        }
-    }
-
-    // Write the last shard
-    if !processed_items.is_empty() {
-        let output_path = write_shard(
-            &output_path,
-            current_shard_idx,
-            &processed_items,
-            schema,
-            &props,
-        )?;
-        shards.push(output_path);
-    }
-
-    Ok(shards)
+    // Wait for the receiver thread to finish
+    receiver_thread.join().unwrap()
 }
 
 #[derive(Parser, Debug)]
