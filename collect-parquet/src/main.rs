@@ -1,6 +1,6 @@
 use arrow::array::RecordBatch;
-use arrow::compute::{cast, concat_batches};
-use arrow::datatypes::Schema;
+use arrow::compute::cast;
+use arrow::datatypes::{Field, Schema};
 use arrow::error::ArrowError;
 use clap::Parser;
 use crossbeam_channel::{bounded, Receiver, Sender};
@@ -58,6 +58,28 @@ fn read_parquet_schema(
     Ok(schema)
 }
 
+/// Drop private tags from a schema.
+/// Private tags are identified by starting with a '('
+fn drop_private_tags(schema: &Schema) -> Schema {
+    let fields = schema
+        .fields()
+        .into_iter()
+        .filter(|f| !f.name().starts_with("("))
+        .map(|f| Field::new(f.name(), f.data_type().clone(), f.is_nullable()))
+        .collect::<Vec<_>>();
+    Schema::new(fields)
+}
+
+/// Convert all fields in a schema to UTF8
+fn convert_fields_to_utf8(schema: &Schema) -> Schema {
+    let fields = schema
+        .fields()
+        .into_iter()
+        .map(|f| Field::new(f.name(), arrow::datatypes::DataType::Utf8, f.is_nullable()))
+        .collect::<Vec<_>>();
+    Schema::new(fields)
+}
+
 /// Read a single Parquet file
 fn read_parquet(
     path: &PathBuf,
@@ -100,6 +122,8 @@ fn create_schema(paths: &Vec<PathBuf>) -> Result<Schema, Error> {
 
     // Read the schemas from the parquet files and aggregate them
     let acc = read_parquet_schema(&paths[0]).unwrap();
+    let acc = drop_private_tags(&acc);
+    let acc = convert_fields_to_utf8(&acc);
     let result = paths
         .par_iter()
         .progress_with(pb)
@@ -110,12 +134,14 @@ fn create_schema(paths: &Vec<PathBuf>) -> Result<Schema, Error> {
                 None
             }
         })
+        .map(|s| drop_private_tags(&s))
+        .map(|s| convert_fields_to_utf8(&s))
         .reduce(
             || acc.clone(),
             |acc, s| match Schema::try_merge(vec![acc.clone(), s]) {
                 Ok(r) => r,
-                Err(_) => {
-                    warn!("Failed to merge schemas");
+                Err(e) => {
+                    warn!("Failed to merge schemas: {}", e);
                     acc
                 }
             },
@@ -179,48 +205,6 @@ fn open_output_shard(path: &PathBuf, index: usize) -> Result<File, Error> {
         message: format!("Failed to create output file: {}", e),
         source: Some(Box::new(e)),
     })
-}
-
-/// Write a single shard
-fn write_shard(
-    output_path: &PathBuf,
-    shard_idx: usize,
-    processed_items: &Vec<RecordBatch>,
-    schema: &Schema,
-    props: &WriterProperties,
-) -> Result<PathBuf, Error> {
-    // Create a new shard file
-    let shard_file = open_output_shard(output_path, shard_idx).unwrap();
-    let mut writer =
-        ArrowWriter::try_new(shard_file, Arc::new(schema.clone()), Some(props.clone())).map_err(
-            |e| Error::Whatever {
-                message: format!("Failed to create struct array: {}", e),
-                source: Some(Box::new(e)),
-            },
-        )?;
-
-    // Concatenate records from this shard
-    let batch = concat_batches(&Arc::new(schema.clone()), processed_items.iter()).map_err(|e| {
-        Error::Whatever {
-            message: format!("Failed to concatenate batches: {}", e),
-            source: Some(Box::new(e)),
-        }
-    })?;
-
-    // Write the batch to the shard
-    writer.write(&batch).map_err(|e| Error::Whatever {
-        message: format!("Failed to write batch: {}", e),
-        source: Some(Box::new(e)),
-    })?;
-    writer.flush().map_err(|e| Error::Whatever {
-        message: format!("Failed to flush writer: {}", e),
-        source: Some(Box::new(e)),
-    })?;
-    writer.close().map_err(|e| Error::Whatever {
-        message: format!("Failed to close writer: {}", e),
-        source: Some(Box::new(e)),
-    })?;
-    Ok(shard_path(output_path, shard_idx))
 }
 
 /// Collect multiple parquet files and write them to an output path
@@ -461,7 +445,14 @@ mod tests {
         let (parquet_path_1, parquet_path_2) = setup_test_files(&parquet_dir.path());
         let paths = vec![parquet_path_1, parquet_path_2];
         let schema = create_schema(&paths).unwrap();
-        assert!(schema.fields().len() == 249);
+        let num_fields = schema.fields().len();
+        let expected = 86;
+        assert!(
+            num_fields == expected,
+            "Expected {} fields, got {}",
+            expected,
+            num_fields
+        );
     }
 
     #[test]
