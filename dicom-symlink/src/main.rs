@@ -171,7 +171,12 @@ struct Args {
     #[arg(help = "Directory to write outputs to")]
     output_dir: PathBuf,
 
-    #[arg(help = "Resolve symlinks in the source directory")]
+    #[arg(
+        short = 'r',
+        long = "resolve",
+        help = "Resolve symlinks in the source directory",
+        default_value = "true"
+    )]
     resolve: bool,
 }
 
