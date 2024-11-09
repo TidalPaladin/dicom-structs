@@ -14,6 +14,10 @@ log = "0.4"
 thiserror = "1.0"
 env_logger = "0.11"
 
+[profile.release]
+codegen-units = 1
+lto = "fat"
+
 [[bin]]
 name = "dicom-symlink"
 path = "src/main.rs"
